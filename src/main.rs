@@ -1,10 +1,12 @@
+#![feature(let_chains)]
+
 use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use chrono_humanize::HumanTime;
 use colored::Colorize;
 use git2::{Commit, Oid, Repository};
 use ignore::Walk; // Add this line
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -24,7 +26,20 @@ struct Todo {
     statement: String,
     author: String,
     commit_hash: String,
-    commit_date: DateTime<Utc>,
+    author_date: DateTime<Utc>,
+    commit_title: String,
+}
+
+fn get_commits_since_main(repo: &Repository) -> Result<HashSet<Oid>, git2::Error> {
+    let main_branch = repo.find_branch("main", git2::BranchType::Local)?;
+    let main_commit = main_branch.get().peel_to_commit()?;
+    let head = repo.head()?.peel_to_commit()?;
+
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push(head.id())?;
+    revwalk.hide(main_commit.id())?;
+
+    revwalk.collect()
 }
 
 fn highlight_todo(line: &str) -> String {
@@ -122,6 +137,8 @@ fn get_todos(repo: &Repository) -> Vec<Todo> {
         }
     };
 
+    let commits_since_main = get_commits_since_main(repo).unwrap();
+
     for delta in diff.deltas() {
         let diff_file = delta.new_file();
 
@@ -141,10 +158,6 @@ fn get_todos(repo: &Repository) -> Vec<Todo> {
         let reader = BufReader::new(file);
         let lines: Vec<_> = reader.lines().map_while(Result::ok).collect();
 
-        // let Ok(blame) = repo.blame_file(&file_path, None) else {
-        //     println!("Failed to get blame for file: {file_path:?}");
-        //     continue;
-        // };
         let blame = match repo.blame_file(relative_file_path, None) {
             Ok(blame) => blame,
             Err(e) => {
@@ -172,16 +185,25 @@ fn get_todos(repo: &Repository) -> Vec<Todo> {
                 }
 
                 let commit = line_to_commit.get(&(idx + 1)).cloned();
-                let (author, commit_hash, commit_date) = commit.map_or_else(
-                    || (String::new(), String::new(), Utc::now()),
+
+                if let Some(commit) = &commit
+                    && !commits_since_main.contains(&commit.id())
+                {
+                    // line has not been modified since main
+                    continue;
+                }
+
+                let (author, commit_hash, author_date, commit_title) = commit.map_or_else(
+                    || (String::new(), String::new(), Utc::now(), String::new()),
                     |commit| {
                         (
                             commit.author().name().unwrap_or("Unknown").to_string(),
                             commit.id().to_string(),
                             DateTime::from_utc(
-                                NaiveDateTime::from_timestamp(commit.time().seconds(), 0),
+                                NaiveDateTime::from_timestamp(commit.author().when().seconds(), 0),
                                 Utc,
                             ),
+                            commit.summary().unwrap_or("").to_string(),
                         )
                     },
                 );
@@ -193,7 +215,8 @@ fn get_todos(repo: &Repository) -> Vec<Todo> {
                     statement,
                     author,
                     commit_hash,
-                    commit_date,
+                    author_date,
+                    commit_title,
                 });
             }
         }
@@ -213,9 +236,10 @@ fn group_todos(todos: Vec<Todo>) -> HashMap<Key, HashMap<String, HashMap<String,
 
     for todo in todos {
         let short_hash = &todo.commit_hash[..7];
-        todo.commit_date.timestamp_nanos_opt().unwrap();
-        let human_time = HumanTime::from(todo.commit_date);
-        let commit_key = format!("[{short_hash}/{human_time}]");
+        todo.author_date.timestamp_nanos_opt().unwrap();
+        let human_time = HumanTime::from(todo.author_date);
+        let title = &todo.commit_title;
+        let commit_key = format!("{} {human_time}", title.underline());
         let author = todo.author.clone();
         let tags = if todo.tags.is_empty() {
             vec!["__no_tag__".to_string()]
@@ -224,7 +248,7 @@ fn group_todos(todos: Vec<Todo>) -> HashMap<Key, HashMap<String, HashMap<String,
         };
 
         let commit_key = Key {
-            timestamp_nanos: todo.commit_date.timestamp_nanos_opt().unwrap(),
+            timestamp_nanos: todo.author_date.timestamp_nanos_opt().unwrap(),
             display: commit_key,
         };
 
@@ -247,7 +271,7 @@ fn print_grouped_todos(
     grouped: &HashMap<Key, HashMap<String, HashMap<String, Vec<Todo>>>>,
 ) -> std::io::Result<()> {
     let mut sorted_commits: Vec<_> = grouped.keys().collect();
-    sorted_commits.sort_by(|a, b| a.timestamp_nanos.cmp(&b.timestamp_nanos));
+    sorted_commits.sort_by(|a, b| a.timestamp_nanos.cmp(&b.timestamp_nanos).reverse());
 
     for commit in sorted_commits {
         let mut tree = TreeBuilder::new(commit.display.clone());
@@ -261,7 +285,7 @@ fn print_grouped_todos(
             let has_tag = tag != "__no_tag__";
 
             let parent_node = if has_tag {
-                tree.begin_child(format!("🏷️ {tag}"))
+                tree.begin_child(tag.to_string())
             } else {
                 &mut tree
             };
@@ -270,7 +294,7 @@ fn print_grouped_todos(
             sorted_authors.sort();
 
             for author in sorted_authors {
-                let author_node = parent_node.begin_child(format!("👤 {author}"));
+                let author_node = parent_node.begin_child(format!("{}", author.italic()));
 
                 for todo in &authors[author] {
                     // get path relative to CWD
