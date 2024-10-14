@@ -16,6 +16,7 @@ walkdir = "2.5.0"
 termcolor = "1.4.1"
 ignore = { version = "0.4.23", features = ["simd-accel"] }
 colored = "2.1.0"
+chrono-humanize = "0.2.3"
 
 [lints.clippy]
 complexity = { level = "deny", priority = -1 }

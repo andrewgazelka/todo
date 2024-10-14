@@ -1,36 +1,30 @@
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono_humanize::HumanTime;
+use colored::Colorize;
+use git2::{Commit, Oid, Repository};
+use ignore::Walk; // Add this line
+use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::rc::Rc;
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
-use colored::Colorize;
-use git2::{Repository, Commit, Oid};
-use regex::Regex;
-use ignore::Walk; // Add this line
+use std::rc::Rc; // Add this import
 
 use ptree::{print_tree, TreeBuilder};
 
-
 // Configuration
 const TODO_PATTERN: &str = r#"(?i)\bTODO\b(?:\((.*?)\))?(?:!|\:)?["'(]?(.*?)[)"']?$"#;
-const COMMENT_PATTERN: &str = r"^\s*(#|//|/\*|\*|<!--|;)";
 
 #[derive(Debug, Clone)]
 struct Todo {
-    file_path: String,
+    file_path: PathBuf,
     line: usize,
     tags: Vec<String>,
     statement: String,
     author: String,
     commit_hash: String,
     commit_date: DateTime<Utc>,
-}
-
-fn is_comment(line: &str) -> bool {
-    let re = Regex::new(COMMENT_PATTERN).unwrap();
-    re.is_match(line)
 }
 
 fn highlight_todo(line: &str) -> String {
@@ -57,108 +51,130 @@ fn highlight_todo(line: &str) -> String {
     result
 }
 
+fn get_diff_with_main(repo: &Repository) -> Result<git2::Diff, git2::Error> {
+    let main_branch = repo.find_branch("main", git2::BranchType::Local)?;
+    let main_tree = main_branch.get().peel_to_tree()?;
+
+    let head = repo.head()?;
+    let head_tree = head.peel_to_tree()?;
+
+    let mut opts = git2::DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+
+    repo.diff_tree_to_tree(Some(&main_tree), Some(&head_tree), Some(&mut opts))
+}
+
 fn parse_todo(line: &str) -> (Vec<String>, String) {
     let re = Regex::new(TODO_PATTERN).unwrap();
-    if let Some(caps) = re.captures(line) {
-        let tags = caps.get(1).map_or(vec![], |m| {
-            m.as_str().split(',').map(|s| s.trim().to_string()).collect()
-        });
-        // todo(lol): abc
-        let todo_match = caps.get(0).unwrap();
+    re.captures(line).map_or_else(
+        || (vec![], line.to_string()),
+        |caps| {
+            let tags = caps.get(1).map_or(vec![], |m| {
+                m.as_str()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect()
+            });
 
-        let colored_line = highlight_todo(&line);
+            let colored_line = highlight_todo(line);
 
-        (tags, colored_line)
-    } else {
-        (vec![], line.to_string())
-    }
+            (tags, colored_line)
+        },
+    )
 }
 
 fn get_repo(path: &Path) -> Result<Repository, git2::Error> {
     Repository::open(path)
 }
 
-fn get_blame_info<'a>(repo: &'a Repository, file_path: &Path) -> Result<Vec<(Commit<'a>, usize)>, git2::Error> {
-    let blame = repo.blame_file(file_path, None)?;
-    let mut result = Vec::new();
-
-    for hunk in blame.iter() {
-        let commit = repo.find_commit(hunk.final_commit_id())?;
+fn get_blame_info<'a>(
+    repo: &'a Repository,
+    blame: &'a git2::Blame,
+) -> impl Iterator<Item = (Commit<'a>, usize)> {
+    blame.iter().map(move |hunk| {
+        let commit = repo
+            .find_commit(hunk.final_commit_id())
+            .expect("Failed to find commit");
         let lines_in_hunk = hunk.lines_in_hunk();
-        result.push((commit, lines_in_hunk));
-    }
-
-    Ok(result)
+        (commit, lines_in_hunk)
+    })
 }
 
 fn is_text_file(file_path: &Path) -> bool {
-    if let Ok(mut file) = File::open(file_path) {
+    File::open(file_path).map_or(false, |mut file| {
         let mut buffer = [0; 1024];
-        if let Ok(size) = file.read(&mut buffer[..]) {
-            !buffer[..size].contains(&0)
-        } else {
-            false
-        }
-    } else {
-        false
-    }
+        file.read(&mut buffer[..])
+            .map_or(false, |size| !buffer[..size].contains(&0))
+    })
 }
 
 fn get_todos(repo: &Repository) -> Vec<Todo> {
     let mut todos = Vec::new();
     let root_dir = repo.workdir().unwrap();
 
-    // Use the ignore::Walk instead of walkdir::WalkDir
-    for entry in Walk::new(root_dir) {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
+    let diff = match get_diff_with_main(repo) {
+        Ok(diff) => diff,
+        Err(e) => {
+            eprintln!("Error getting diff with main: {e}");
+            return todos;
+        }
+    };
+
+    for delta in diff.deltas() {
+        let diff_file = delta.new_file();
+
+        let Some(relative_file_path) = diff_file.path() else {
+            continue;
         };
 
-        let file_path = entry.path();
-        if !file_path.is_file() || !is_text_file(file_path) {
+        let file_path = root_dir.join(relative_file_path);
+        if !file_path.is_file() || !is_text_file(&file_path) {
             continue;
         }
 
-        let relative_path = file_path.strip_prefix(root_dir).unwrap();
+        let Ok(file) = File::open(&file_path) else {
+            continue;
+        };
 
-        if let Ok(file) = File::open(file_path) {
-            let reader = BufReader::new(file);
-            let mut has_todo = false;
-            let lines: Vec<_> = reader.lines().filter_map(|l| l.ok()).collect();
+        let reader = BufReader::new(file);
+        let lines: Vec<_> = reader.lines().map_while(Result::ok).collect();
 
-            for (idx, line) in lines.iter().enumerate() {
-                if line.to_lowercase().contains("todo") {
-                    has_todo = true;
-                    break;
-                }
-            }
-
-            if !has_todo {
+        // let Ok(blame) = repo.blame_file(&file_path, None) else {
+        //     println!("Failed to get blame for file: {file_path:?}");
+        //     continue;
+        // };
+        let blame = match repo.blame_file(relative_file_path, None) {
+            Ok(blame) => blame,
+            Err(e) => {
+                println!("Failed to get blame for file: {file_path:?}: {e}");
                 continue;
             }
+        };
 
-            let blame_info = get_blame_info(repo, relative_path).unwrap_or_default();
-            let mut line_to_commit = HashMap::new();
-            let mut current_line = 1;
+        let mut line_to_commit = HashMap::new();
+        let mut current_line = 1;
 
-            for (commit, committed_lines) in blame_info {
-                let commit = Rc::new(commit);
-                for _ in 0..committed_lines {
-                    line_to_commit.insert(current_line, commit.clone());
-                    current_line += 1;
-                }
+        for (commit, committed_lines) in get_blame_info(repo, &blame) {
+            let commit = Rc::new(commit);
+            for _ in 0..committed_lines {
+                line_to_commit.insert(current_line, commit.clone());
+                current_line += 1;
             }
+        }
 
-            for (idx, line) in lines.iter().enumerate() {
-                if line.to_lowercase().contains("todo") {
-                    let (tags, statement) = parse_todo(line);
-                    if statement.is_empty() {
-                        continue;
-                    }
+        for (idx, line) in lines.iter().enumerate() {
+            if line.to_lowercase().contains("todo") {
+                let (tags, statement) = parse_todo(line);
+                if statement.is_empty() {
+                    continue;
+                }
 
-                    let commit = line_to_commit.get(&(idx + 1)).cloned();
-                    let (author, commit_hash, commit_date) = if let Some(commit) = commit {
+                let commit = line_to_commit.get(&(idx + 1)).cloned();
+                let (author, commit_hash, commit_date) = commit.map_or_else(
+                    || (String::new(), String::new(), Utc::now()),
+                    |commit| {
                         (
                             commit.author().name().unwrap_or("Unknown").to_string(),
                             commit.id().to_string(),
@@ -167,24 +183,18 @@ fn get_todos(repo: &Repository) -> Vec<Todo> {
                                 Utc,
                             ),
                         )
-                    } else {
-                        (
-                            "Uncommitted".to_string(),
-                            "Uncommitted".to_string(),
-                            Utc::now(),
-                        )
-                    };
+                    },
+                );
 
-                    todos.push(Todo {
-                        file_path: relative_path.to_string_lossy().to_string(),
-                        line: idx + 1,
-                        tags,
-                        statement,
-                        author,
-                        commit_hash,
-                        commit_date,
-                    });
-                }
+                todos.push(Todo {
+                    file_path: file_path.clone(),
+                    line: idx + 1,
+                    tags,
+                    statement,
+                    author,
+                    commit_hash,
+                    commit_date,
+                });
             }
         }
     }
@@ -192,16 +202,30 @@ fn get_todos(repo: &Repository) -> Vec<Todo> {
     todos
 }
 
-fn group_todos(todos: Vec<Todo>) -> HashMap<String, HashMap<String, HashMap<String, Vec<Todo>>>> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Key {
+    timestamp_nanos: i64,
+    display: String,
+}
+
+fn group_todos(todos: Vec<Todo>) -> HashMap<Key, HashMap<String, HashMap<String, Vec<Todo>>>> {
     let mut grouped = HashMap::new();
 
     for todo in todos {
-        let commit_key = format!("[{}/{}]", todo.commit_hash, todo.commit_date.format("%Y-%m-%d"));
+        let short_hash = &todo.commit_hash[..7];
+        todo.commit_date.timestamp_nanos_opt().unwrap();
+        let human_time = HumanTime::from(todo.commit_date);
+        let commit_key = format!("[{short_hash}/{human_time}]");
         let author = todo.author.clone();
         let tags = if todo.tags.is_empty() {
             vec!["__no_tag__".to_string()]
         } else {
             todo.tags.clone()
+        };
+
+        let commit_key = Key {
+            timestamp_nanos: todo.commit_date.timestamp_nanos_opt().unwrap(),
+            display: commit_key,
         };
 
         for tag in tags {
@@ -219,18 +243,14 @@ fn group_todos(todos: Vec<Todo>) -> HashMap<String, HashMap<String, HashMap<Stri
     grouped
 }
 
-fn print_grouped_todos(grouped: HashMap<String, HashMap<String, HashMap<String, Vec<Todo>>>>) -> std::io::Result<()> {
-    let mut tree = TreeBuilder::new("📋 TODOs".to_string());
-
+fn print_grouped_todos(
+    grouped: &HashMap<Key, HashMap<String, HashMap<String, Vec<Todo>>>>,
+) -> std::io::Result<()> {
     let mut sorted_commits: Vec<_> = grouped.keys().collect();
-    sorted_commits.sort_by(|a, b| {
-        let date_a = a.split('/').nth(1).unwrap().trim_end_matches(']');
-        let date_b = b.split('/').nth(1).unwrap().trim_end_matches(']');
-        date_b.cmp(date_a)
-    });
+    sorted_commits.sort_by(|a, b| a.timestamp_nanos.cmp(&b.timestamp_nanos));
 
     for commit in sorted_commits {
-        let commit_node = tree.begin_child(commit.to_string());
+        let mut tree = TreeBuilder::new(commit.display.clone());
         let tags = &grouped[commit];
 
         let mut sorted_tags: Vec<_> = tags.keys().collect();
@@ -238,44 +258,63 @@ fn print_grouped_todos(grouped: HashMap<String, HashMap<String, HashMap<String, 
 
         for tag in sorted_tags {
             let authors = &tags[tag];
-            let tag_display = if tag == "__no_tag__" { "No Tag" } else { tag };
-            let tag_node = commit_node.begin_child(format!("🏷️ Tag: {}", tag_display));
+            let has_tag = tag != "__no_tag__";
+
+            let parent_node = if has_tag {
+                tree.begin_child(format!("🏷️ {tag}"))
+            } else {
+                &mut tree
+            };
 
             let mut sorted_authors: Vec<_> = authors.keys().collect();
             sorted_authors.sort();
 
             for author in sorted_authors {
-                let author_node = tag_node.begin_child(format!("👤 Author: {}", author));
+                let author_node = parent_node.begin_child(format!("👤 {author}"));
 
                 for todo in &authors[author] {
-                    let file_link = format!("{}:{}", todo.file_path, todo.line);
-                    let todo_text = format!(
-                        "{} - {}",
-                        file_link,
-                        todo.statement.trim()
-                    );
+                    // get path relative to CWD
+                    let file_link = get_relative_or_absolute_path(&todo.file_path)?;
+                    let file_link = file_link.display();
+
+                    let file_link = format!("{}:{}", file_link, todo.line);
+                    let todo_text = format!("{} - {}", file_link, todo.statement.trim());
                     author_node.add_empty_child(todo_text);
                 }
 
                 author_node.end_child();
             }
 
-            tag_node.end_child();
+            if has_tag {
+                parent_node.end_child();
+            }
         }
 
-        commit_node.end_child();
+        tree.end_child();
+
+        let tree = tree.build();
+        print_tree(&tree)?;
+        println!();
     }
+    Ok(())
+}
 
-    let tree = tree.build();
+fn get_relative_or_absolute_path(file_path: &Path) -> std::io::Result<PathBuf> {
+    // Get the current working directory
+    let current_dir = std::env::current_dir()?;
 
-    print_tree(&tree)
+    // Attempt to get the relative path
+    file_path.strip_prefix(&current_dir).map_or_else(
+        |_| file_path.canonicalize(),
+        |relative_path| Ok(relative_path.to_path_buf()),
+    )
 }
 
 fn main() {
     let repo = match get_repo(Path::new(".")) {
         Ok(repo) => repo,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {e}");
             exit(1);
         }
     };
@@ -288,5 +327,5 @@ fn main() {
     }
 
     let grouped = group_todos(todos);
-    print_grouped_todos(grouped).unwrap();
+    print_grouped_todos(&grouped).unwrap();
 }
